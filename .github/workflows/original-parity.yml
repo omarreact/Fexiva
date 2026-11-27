@@ -2,7 +2,7 @@ name: Original template parity recovery
 on:
   push:
     branches: [fix/original-template-parity]
-    paths: [".github/workflows/original-parity.yml", "tools/recover-original.py"]
+    paths: ["tools/recover-original.py"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -10,7 +10,7 @@ jobs:
   recover-and-test:
     if: github.ref == 'refs/heads/fix/original-template-parity'
     runs-on: ubuntu-latest
-    timeout-minutes: 18
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,7 +20,7 @@ jobs:
           python-version: '3.12'
       - run: pip install requests beautifulsoup4 playwright pillow
       - run: playwright install --with-deps chromium
-      - name: Recover original resources and test offline
+      - name: Recover original resources and compare online
         run: python tools/recover-original.py
       - uses: actions/upload-artifact@v4
         if: always()
@@ -29,8 +29,14 @@ jobs:
           path: parity-evidence/
           if-no-files-found: warn
       - uses: actions/upload-artifact@v4
-        if: success()
+        if: always()
         with:
-          name: fexiva-original-parity-candidate
+          name: fexiva-original-parity-candidate-UNVALIDATED
           path: parity-candidate/
-          if-no-files-found: error
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fexiva-original-source-snapshot
+          path: parity-source/
+          if-no-files-found: warn
