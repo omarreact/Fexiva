@@ -15,6 +15,10 @@ ROOT=Path("parity-candidate")
 QA=Path("parity-evidence")
 ROOT.mkdir(exist_ok=True)
 QA.mkdir(exist_ok=True)
+SOURCE=Path("parity-source")
+SOURCE.mkdir(exist_ok=True)
+report_source={}
+
 HOSTS={"fexiva.webflow.io","cdn.prod.website-files.com","assets.website-files.com","uploads-ssl.webflow.com","d3e54v103j8qbb.cloudfront.net","unpkg.com","fonts.googleapis.com","fonts.gstatic.com","ajax.googleapis.com","cdn.jsdelivr.net","cdnjs.cloudflare.com"}
 s=requests.Session()
 s.headers["User-Agent"]="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -36,6 +40,13 @@ def fetch(url, allow404=False):
     if len(r.content)>30_000_000:
         raise ValueError("Resource too large: "+url)
     cache[url]=r
+    # Preserve the exact downloaded bytes before any path rewriting.
+    name=re.sub(r"[^A-Za-z0-9._-]","-",unquote(Path(p.path).name) or "index.html")
+    snapshot=SOURCE/"raw"/(hashlib.sha256(url.encode()).hexdigest()[:16]+"-"+name[:120])
+    snapshot.parent.mkdir(parents=True,exist_ok=True)
+    snapshot.write_bytes(r.content)
+    report_source[url]={"path":str(snapshot.relative_to(SOURCE)),"sha256":hashlib.sha256(r.content).hexdigest(),"content_type":r.headers.get("Content-Type",""),"status":r.status_code}
+    (SOURCE/"manifest.json").write_text(json.dumps(report_source,indent=2))
     return r
 def relative(path,page):
     return os.path.relpath(path,page.parent).replace(os.sep,"/")
@@ -187,6 +198,41 @@ def build(route,p):
             (parts/"header.html").write_text(str(header),encoding="utf-8")
             (parts/"footer.html").write_text(str(footer),encoding="utf-8")
     report["routes"].append({"path":str(p),"url":url,"status":response.status_code})
+def animation_states(page):
+    # Inspect actual initialized animation elements, rather than counting every
+    # SVG path. Lazy or hidden tab animations must be tested when activated.
+    def snapshot():
+        return page.evaluate("""() => [...document.querySelectorAll('[data-animation-type=lottie]')].map((e,i)=>({index:i,source:(e.getAttribute('data-src')||'').split('/').pop(),class_name:String(e.className),id:e.id,visible:!!(e.offsetWidth&&e.offsetHeight&&e.getClientRects().length),renderer:!!e.querySelector('svg,canvas'),children:e.childElementCount,nearest_tab:e.closest('[data-w-tab]')?.getAttribute('data-w-tab')||null}))""")
+    initial=snapshot()
+    if not initial:
+        return {"initial":[],"states":[],"ever_rendered":[],"missing":[]}
+    states=[{"state":"initial","animations":initial}]
+    # Scroll each original animation into the viewport to trigger lazy loads.
+    for i in range(len(initial)):
+        try:
+            e=page.locator('[data-animation-type=lottie]').nth(i)
+            if e.is_visible():
+                e.scroll_into_view_if_needed(timeout=3000)
+                page.wait_for_timeout(350)
+        except Exception:
+            pass
+    states.append({"state":"scrolled","animations":snapshot()})
+    # Activate each visible Webflow tab without navigating away.
+    tabs=page.locator('.w-tab-link')
+    for i in range(min(tabs.count(),24)):
+        try:
+            t=tabs.nth(i)
+            if not t.is_visible():
+                continue
+            name=t.get_attribute("data-w-tab") or str(i)
+            t.click(timeout=3000)
+            page.wait_for_timeout(450)
+            states.append({"state":"tab:"+name,"animations":snapshot()})
+        except Exception as e:
+            states.append({"state":"tab_error:"+str(i),"error":str(e)[:500],"animations":snapshot()})
+    seen=sorted({e["index"] for st in states for e in st["animations"] if e["renderer"]})
+    return {"initial":initial,"states":states,"ever_rendered":seen,"missing":[i for i in range(len(initial)) if i not in seen]}
+
 def qa():
     # Use a real HTTP origin and the same /Fexiva/ prefix as GitHub Pages.
     # No server is required for the actual hosted static website.
@@ -217,25 +263,30 @@ def qa():
                         result=page.evaluate("""() => ({width:document.documentElement.scrollWidth,visible:!!document.body.innerText.trim(),broken:[...document.images].filter(i=>i.complete&&!i.naturalWidth).map(i=>i.getAttribute('src')),lottie_count:document.querySelectorAll('[data-animation-type=lottie]').length,rendered_lottie:document.querySelectorAll('[data-animation-type=lottie] svg,[data-animation-type=lottie] canvas').length,overflow:[...document.querySelectorAll('body *')].filter(e=>e.getBoundingClientRect().right>innerWidth+2&&getComputedStyle(e).position!=='fixed').slice(0,15).map(e=>({tag:e.tagName,cls:String(e.className).slice(0,150),right:Math.round(e.getBoundingClientRect().right)}))})""")
                         required=[x for x in bad if x["method"] in ("GET","HEAD") and (x["url"].startswith(host) or x["kind"] in ("image","stylesheet","font","script")) and not x["url"].startswith("https://challenges.cloudflare.com/")]
                         row={"page":str(p),"width":w,"result":result,"js_errors":errors,"external_requests":external,"network_failures":bad,"required_failures":required}
-                        report["online_checks"].append(row)
-                        if not result["visible"] or result["width"]>w+2 or result["broken"] or errors or required or result["rendered_lottie"]<result["lottie_count"]:
+                        if not result["visible"] or result["width"]>w+2 or result["broken"] or errors or required:
                             report["failures"].append(row)
-                        if p in (Path("index.html"),Path("inner-pages/features.html"),Path("inner-pages/about.html")) and w in (390,1440):
-                            name=p.stem+"-"+str(w)
-                            page.screenshot(path=str(QA/(name+"-candidate.png")))
+                        if w in (390,1440):
+                            name=str(p).replace("/","--").removesuffix(".html")+"-"+str(w)
+                            page.screenshot(path=str(QA/(name+"-candidate.png")),full_page=True,timeout=45000)
                             live=browser.new_page(viewport={"width":w,"height":900})
                             live.route("**/*",lambda route:route.continue_() if route.request.method in ("GET","HEAD","OPTIONS") else route.abort())
                             try:
                                 live.goto(urljoin(ORIGIN,next(r for r,v in routes.items() if v==p)),wait_until="load",timeout=45000)
                                 live.wait_for_timeout(1600)
-                                live.screenshot(path=str(QA/(name+"-original.png")))
+                                live.screenshot(path=str(QA/(name+"-original.png")),full_page=True,timeout=45000)
                                 a=Image.open(QA/(name+"-candidate.png")).convert("RGB")
                                 b=Image.open(QA/(name+"-original.png")).convert("RGB")
-                                report["comparisons"].append({"page":str(p),"width":w,"mean_rgb_difference":ImageStat.Stat(ImageChops.difference(a,b)).mean,"note":"Animation phases may differ; manual visual review still required."})
+                                report["comparisons"].append({"page":str(p),"width":w,"candidate_size":a.size,"original_size":b.size,"mean_rgb_difference":ImageStat.Stat(ImageChops.difference(a,b)).mean if a.size==b.size else None,"note":"Animation phases and page heights may differ; manual visual review still required."})
+                                row["original_animations"]=animation_states(live)
+                                row["original_scroll_width"]=live.evaluate("document.documentElement.scrollWidth")
                             except Exception as e:
                                 report["failures"].append({"page":str(p),"live_comparison":str(e)})
                             finally:
                                 live.close()
+                        row["candidate_animations"]=animation_states(page)
+                        if row["candidate_animations"]["missing"]:
+                            report["failures"].append({"page":str(p),"width":w,"animation_failure":row["candidate_animations"],"original_animations":row.get("original_animations")})
+                        report["online_checks"].append(row)
                         page.close()
                     ctx.close()
                     save()
@@ -249,6 +300,8 @@ try:
         save()
     if len(report["animations"])!=13:
         raise ValueError("Original animation count changed: "+str(len(report["animations"])))
+    # Produce the candidate before QA; do not lose collected resources if tests fail.
+    (ROOT/"README.md").write_text("Fexiva online source recovery candidate. NOT approved for production until QA and licensing are reviewed. Forms do not transmit visitor data.\n")
     qa()
     if report["failures"]:
         raise RuntimeError("Unresolved online or visual QA failures")
