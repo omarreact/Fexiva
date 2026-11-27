@@ -1,0 +1,53 @@
+name: Import Fexiva offline website
+on:
+  push:
+    branches: [main]
+    paths: [fexiva-offline.zip]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: fexiva-offline-import
+  cancel-in-progress: false
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Verify and extract the exact offline release
+        run: |
+          echo 'ad19c0998375788c090cc919e8b3858dcbb34cfb9f969c8b41f3f77544dcab5e  fexiva-offline.zip' | sha256sum -c -
+          python - <<'PY'
+          import zipfile, pathlib, stat
+          with zipfile.ZipFile('fexiva-offline.zip') as z:
+              files = z.infolist()
+              assert len(files) == 149
+              assert z.testzip() is None
+              for item in files:
+                  p = pathlib.PurePosixPath(item.filename)
+                  assert p.parts[0] == 'fexiva' and len(p.parts) > 1
+                  assert not p.is_absolute() and '..' not in p.parts
+                  assert not stat.S_ISLNK(item.external_attr >> 16)
+                  target = pathlib.Path(*p.parts[1:])
+                  assert target.parts[0] in {'index.html', '404.html', 'README.md', 'assets', 'parts', 'inner-pages'}
+                  if not item.is_dir():
+                      target.parent.mkdir(parents=True, exist_ok=True)
+                      target.write_bytes(z.read(item))
+          assert pathlib.Path('index.html').is_file()
+          assert pathlib.Path('assets/css/style.css').is_file()
+          assert pathlib.Path('assets/js/script.js').is_file()
+          PY
+      - name: Commit website source
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- index.html 404.html README.md assets parts inner-pages
+          if git diff --cached --quiet; then
+            echo 'Already imported'
+            exit 0
+          fi
+          git commit -m 'Import verified Fexiva offline HTML website'
+          git push origin HEAD:main
